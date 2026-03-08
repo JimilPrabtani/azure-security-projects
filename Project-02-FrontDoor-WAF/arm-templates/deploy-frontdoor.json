@@ -1,0 +1,361 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Deploys Azure Front Door Standard with WAF policy, multi-region App Service backends, and monitoring for AZ-500 security lab."
+  },
+  "parameters": {
+    "primaryLocation": {
+      "type": "string",
+      "defaultValue": "eastus",
+      "metadata": {
+        "description": "Primary Azure region for backend"
+      }
+    },
+    "secondaryLocation": {
+      "type": "string",
+      "defaultValue": "westus",
+      "metadata": {
+        "description": "Secondary Azure region for backend failover"
+      }
+    },
+    "primaryWebAppName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the primary Web App (must be globally unique)"
+      }
+    },
+    "secondaryWebAppName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the secondary Web App (must be globally unique)"
+      }
+    },
+    "frontDoorName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Front Door profile (must be globally unique)"
+      }
+    },
+    "wafMode": {
+      "type": "string",
+      "defaultValue": "Prevention",
+      "allowedValues": [
+        "Detection",
+        "Prevention"
+      ],
+      "metadata": {
+        "description": "WAF mode: Detection (log only) or Prevention (block)"
+      }
+    }
+  },
+  "variables": {
+    "primaryPlanName": "asp-fd-primary",
+    "secondaryPlanName": "asp-fd-secondary",
+    "wafPolicyName": "wafpolicyfd",
+    "endpointName": "endpoint-security",
+    "logWorkspaceName": "log-frontdoor-security"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Web/serverfarms",
+      "apiVersion": "2022-09-01",
+      "name": "[variables('primaryPlanName')]",
+      "location": "[parameters('primaryLocation')]",
+      "kind": "linux",
+      "sku": {
+        "name": "F1",
+        "tier": "Free"
+      },
+      "properties": {
+        "reserved": true
+      }
+    },
+    {
+      "type": "Microsoft.Web/serverfarms",
+      "apiVersion": "2022-09-01",
+      "name": "[variables('secondaryPlanName')]",
+      "location": "[parameters('secondaryLocation')]",
+      "kind": "linux",
+      "sku": {
+        "name": "F1",
+        "tier": "Free"
+      },
+      "properties": {
+        "reserved": true
+      }
+    },
+    {
+      "type": "Microsoft.Web/sites",
+      "apiVersion": "2022-09-01",
+      "name": "[parameters('primaryWebAppName')]",
+      "location": "[parameters('primaryLocation')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/serverfarms', variables('primaryPlanName'))]"
+      ],
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', variables('primaryPlanName'))]",
+        "httpsOnly": true,
+        "siteConfig": {
+          "linuxFxVersion": "NODE|18-lts",
+          "minTlsVersion": "1.2",
+          "ftpsState": "Disabled"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Web/sites",
+      "apiVersion": "2022-09-01",
+      "name": "[parameters('secondaryWebAppName')]",
+      "location": "[parameters('secondaryLocation')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/serverfarms', variables('secondaryPlanName'))]"
+      ],
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', variables('secondaryPlanName'))]",
+        "httpsOnly": true,
+        "siteConfig": {
+          "linuxFxVersion": "NODE|18-lts",
+          "minTlsVersion": "1.2",
+          "ftpsState": "Disabled"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/FrontDoorWebApplicationFirewallPolicies",
+      "apiVersion": "2022-05-01",
+      "name": "[variables('wafPolicyName')]",
+      "location": "global",
+      "sku": {
+        "name": "Standard_AzureFrontDoor"
+      },
+      "properties": {
+        "policySettings": {
+          "enabledState": "Enabled",
+          "mode": "[parameters('wafMode')]",
+          "requestBodyCheck": "Enabled"
+        },
+        "managedRules": {
+          "managedRuleSets": [
+            {
+              "ruleSetType": "DefaultRuleSet",
+              "ruleSetVersion": "2.1"
+            }
+          ]
+        },
+        "customRules": {
+          "rules": [
+            {
+              "name": "RateLimitRule",
+              "priority": 10,
+              "ruleType": "RateLimitRule",
+              "action": "Block",
+              "rateLimitThreshold": 100,
+              "rateLimitDurationInMinutes": 1,
+              "matchConditions": [
+                {
+                  "matchVariable": "RequestUri",
+                  "operator": "Contains",
+                  "matchValue": [
+                    "/"
+                  ]
+                }
+              ]
+            },
+            {
+              "name": "BlockScanners",
+              "priority": 20,
+              "ruleType": "MatchRule",
+              "action": "Block",
+              "matchConditions": [
+                {
+                  "matchVariable": "RequestHeader",
+                  "selector": "User-Agent",
+                  "operator": "Contains",
+                  "matchValue": [
+                    "scanner",
+                    "sqlmap",
+                    "nikto",
+                    "nmap",
+                    "masscan"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Cdn/profiles",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('frontDoorName')]",
+      "location": "global",
+      "sku": {
+        "name": "Standard_AzureFrontDoor"
+      },
+      "properties": {}
+    },
+    {
+      "type": "Microsoft.Cdn/profiles/afdEndpoints",
+      "apiVersion": "2023-05-01",
+      "name": "[concat(parameters('frontDoorName'), '/', variables('endpointName'))]",
+      "location": "global",
+      "dependsOn": [
+        "[resourceId('Microsoft.Cdn/profiles', parameters('frontDoorName'))]"
+      ],
+      "properties": {
+        "enabledState": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.Cdn/profiles/originGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[concat(parameters('frontDoorName'), '/backend-origins')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Cdn/profiles', parameters('frontDoorName'))]"
+      ],
+      "properties": {
+        "healthProbeSettings": {
+          "probePath": "/",
+          "probeRequestType": "GET",
+          "probeProtocol": "Https",
+          "probeIntervalInSeconds": 30
+        },
+        "loadBalancingSettings": {
+          "sampleSize": 4,
+          "successfulSamplesRequired": 3,
+          "additionalLatencyInMilliseconds": 50
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Cdn/profiles/originGroups/origins",
+      "apiVersion": "2023-05-01",
+      "name": "[concat(parameters('frontDoorName'), '/backend-origins/primary-origin')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Cdn/profiles/originGroups', parameters('frontDoorName'), 'backend-origins')]",
+        "[resourceId('Microsoft.Web/sites', parameters('primaryWebAppName'))]"
+      ],
+      "properties": {
+        "hostName": "[concat(parameters('primaryWebAppName'), '.azurewebsites.net')]",
+        "originHostHeader": "[concat(parameters('primaryWebAppName'), '.azurewebsites.net')]",
+        "httpPort": 80,
+        "httpsPort": 443,
+        "priority": 1,
+        "weight": 1000,
+        "enabledState": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.Cdn/profiles/originGroups/origins",
+      "apiVersion": "2023-05-01",
+      "name": "[concat(parameters('frontDoorName'), '/backend-origins/secondary-origin')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Cdn/profiles/originGroups', parameters('frontDoorName'), 'backend-origins')]",
+        "[resourceId('Microsoft.Web/sites', parameters('secondaryWebAppName'))]"
+      ],
+      "properties": {
+        "hostName": "[concat(parameters('secondaryWebAppName'), '.azurewebsites.net')]",
+        "originHostHeader": "[concat(parameters('secondaryWebAppName'), '.azurewebsites.net')]",
+        "httpPort": 80,
+        "httpsPort": 443,
+        "priority": 2,
+        "weight": 1000,
+        "enabledState": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.Cdn/profiles/afdEndpoints/routes",
+      "apiVersion": "2023-05-01",
+      "name": "[concat(parameters('frontDoorName'), '/', variables('endpointName'), '/default-route')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Cdn/profiles/afdEndpoints', parameters('frontDoorName'), variables('endpointName'))]",
+        "[resourceId('Microsoft.Cdn/profiles/originGroups', parameters('frontDoorName'), 'backend-origins')]",
+        "[resourceId('Microsoft.Cdn/profiles/originGroups/origins', parameters('frontDoorName'), 'backend-origins', 'primary-origin')]",
+        "[resourceId('Microsoft.Cdn/profiles/originGroups/origins', parameters('frontDoorName'), 'backend-origins', 'secondary-origin')]"
+      ],
+      "properties": {
+        "originGroup": {
+          "id": "[resourceId('Microsoft.Cdn/profiles/originGroups', parameters('frontDoorName'), 'backend-origins')]"
+        },
+        "supportedProtocols": [
+          "Https",
+          "Http"
+        ],
+        "patternsToMatch": [
+          "/*"
+        ],
+        "forwardingProtocol": "HttpsOnly",
+        "httpsRedirect": "Enabled",
+        "linkToDefaultDomain": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.Cdn/profiles/securityPolicies",
+      "apiVersion": "2023-05-01",
+      "name": "[concat(parameters('frontDoorName'), '/waf-security-policy')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Cdn/profiles', parameters('frontDoorName'))]",
+        "[resourceId('Microsoft.Cdn/profiles/afdEndpoints', parameters('frontDoorName'), variables('endpointName'))]",
+        "[resourceId('Microsoft.Network/FrontDoorWebApplicationFirewallPolicies', variables('wafPolicyName'))]"
+      ],
+      "properties": {
+        "parameters": {
+          "type": "WebApplicationFirewall",
+          "wafPolicy": {
+            "id": "[resourceId('Microsoft.Network/FrontDoorWebApplicationFirewallPolicies', variables('wafPolicyName'))]"
+          },
+          "associations": [
+            {
+              "domains": [
+                {
+                  "id": "[resourceId('Microsoft.Cdn/profiles/afdEndpoints', parameters('frontDoorName'), variables('endpointName'))]"
+                }
+              ],
+              "patternsToMatch": [
+                "/*"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2022-10-01",
+      "name": "[variables('logWorkspaceName')]",
+      "location": "[parameters('primaryLocation')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        },
+        "retentionInDays": 30
+      }
+    }
+  ],
+  "outputs": {
+    "frontDoorEndpointHostName": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Cdn/profiles/afdEndpoints', parameters('frontDoorName'), variables('endpointName'))).hostName]"
+    },
+    "primaryWebAppUrl": {
+      "type": "string",
+      "value": "[concat('https://', parameters('primaryWebAppName'), '.azurewebsites.net')]"
+    },
+    "secondaryWebAppUrl": {
+      "type": "string",
+      "value": "[concat('https://', parameters('secondaryWebAppName'), '.azurewebsites.net')]"
+    },
+    "logAnalyticsWorkspaceId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.OperationalInsights/workspaces', variables('logWorkspaceName'))]"
+    }
+  }
+}
